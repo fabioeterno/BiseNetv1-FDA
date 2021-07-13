@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 import torch.cuda.amp as amp
 from dataset.CamVid import CamVid
 import os
+from torchvision import transforms
 from model.build_BiSeNet import BiSeNet
 import torch
 from tensorboardX import SummaryWriter
@@ -11,7 +12,7 @@ import tqdm
 import numpy as np
 from utils import poly_lr_scheduler
 from utils import reverse_one_hot, compute_global_accuracy, fast_hist, \
-    per_class_iu
+    per_class_iu, FDA_source_to_target_np
 from loss import DiceLoss
 from dataset.IDDA import IDDA, colorize_mask  
 #from AdaptSeg
@@ -72,15 +73,10 @@ def val(args, model, dataloader):
         miou = np.mean(miou_list)
         print('precision per pixel for test: %.3f' % precision)
         print('mIoU for validation: %.3f' % miou)
-        # miou_str = ''
-        # for key in miou_dict:
-        #     miou_str += '{}:{},\n'.format(key, miou_dict[key])
-        # print('mIoU for each class:')
-        # print(miou_str)
         return precision, miou
 
 
-def train(args, model, optimizer, dataloader_source, dataloader_target, dataloader_val, curr_epoch, model_D1, optimizer_D1, interp, interp_target, bce_loss):
+def train(args, model, optimizer, dataloader_source, dataloader_target, dataloader_val, curr_epoch, model_D1, optimizer_D1, model_D2, optimizer_D2, model_D3, optimizer_D3, interp, interp_target, bce_loss):
     import os
     print("Folder to save already present? : " + str(os.path.isdir(args.save_model_path)))
     writer = SummaryWriter(comment=''.format(args.optimizer, args.context_path))
@@ -96,7 +92,6 @@ def train(args, model, optimizer, dataloader_source, dataloader_target, dataload
 
     scaler = amp.GradScaler()
 
-
     for epoch in range(curr_epoch, args.num_epochs):
         # Learning rate of the model, default value 0.02500, but if a pretrained model is recovered is adapted
         lr = poly_lr_scheduler(optimizer, args.learning_rate, iter=epoch, max_iter=args.num_epochs)
@@ -108,22 +103,24 @@ def train(args, model, optimizer, dataloader_source, dataloader_target, dataload
         sourceloader_iter = enumerate(dataloader_source)
 
         print("")
-        print("target lenght: " + str(len(dataloader_target)) + "source lenght: " + str(len(dataloader_source)) )
+        print("target lenght: " + str(len(dataloader_target)) + ", source lenght: " + str(len(dataloader_source)) )
 
         iterations = len(dataloader_target)
 
         for i in range(iterations):
-        #for i in range(2):
 
 
             adjust_learning_rate_D(args, optimizer, epoch)
             adjust_learning_rate_D(args, optimizer_D1, epoch)
+            adjust_learning_rate_D(args, optimizer_D2, epoch)
+            adjust_learning_rate_D(args, optimizer_D3, epoch)
             optimizer.zero_grad()
             optimizer_D1.zero_grad()
+            optimizer_D2.zero_grad()
+            optimizer_D3.zero_grad()
 
             _, batch = next(sourceloader_iter)
             data, label = batch
-            #print("data " + str(data.shape) + "  " + " label: " + str(label.shape))
             
             if torch.cuda.is_available() and args.use_gpu:
                 data = data.cuda()
@@ -133,126 +130,151 @@ def train(args, model, optimizer, dataloader_source, dataloader_target, dataload
 
             for param in model_D1.parameters():
                 param.requires_grad = False
+            for param in model_D2.parameters():
+                param.requires_grad = False
+            for param in model_D3.parameters():
+                param.requires_grad = False
 
             loss_seg_value1 = 0
             loss_adv_target_value1 = 0
+            loss_adv_target_value2 = 0
+            loss_adv_target_value3 = 0
             loss_D_value1 = 0
+            loss_D_value2 = 0
+            loss_D_value3 = 0
+
+
+            # target images
+            _, batch = next(targetloader_iter)
+
+            images, _ = batch
+            images = images.cuda()
+
+            # Applying FDA to make the source images of IDDA looks like the target images
+            src_in_trg1 = FDA_source_to_target_np(data[0,:,:,:].squeeze(), images[0,:,:,:].squeeze(), L=0.1)
+            src_in_trg2 = FDA_source_to_target_np(data[1,:,:,:].squeeze(), images[1,:,:,:].squeeze(), L=0.1)
+            src_in_trg1 = torch.from_numpy(src_in_trg1).unsqueeze(dim=0).float()
+            src_in_trg2 = torch.from_numpy(src_in_trg2).unsqueeze(dim=0).float()
+
+            #Normalizing source
+            normalization = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+
+            src_in_trg1 = normalization(src_in_trg1)
+            src_in_trg2 = normalization(src_in_trg2)
+            source_after_fda = torch.cat((src_in_trg1,src_in_trg2))
+
+            # normalize the target
+            images[0,:,:,:] = normalization(images[0,:,:,:])
+            images[1,:,:,:] = normalization(images[1,:,:,:])
 
             #Train G with source
             with amp.autocast():
-                output, output_sup1, output_sup2 = model(data)
+                # Feature extractor source
+                output, output_sup1, output_sup2 = model(source_after_fda) # probability prediction of source
 
                 loss1 = loss_func(output, label)
                 loss2 = loss_func(output_sup1, label)
                 loss3 = loss_func(output_sup2, label)
                 loss = loss1 + loss2 + loss3
 
-            #print("")
-            #print("output.shape " + str(output.shape))
-            #print("output_sup1.shape " + str(output_sup1.shape))
-            #print("output_sup2.shape " + str(output_sup2.shape))
-
-            #output = interp(output)
-            #output_sup1 = interp(output_sup1)
-            #output_sup2 = interp(output_sup2)
-
-            #print("loss1.shape " + str(loss1))
-            #print("loss2.shape " + str(loss2))
-            #print("loss3.shape " + str(loss3))
-            #print("loss1 + loss2 + loss3  " + str(loss))
-
             # proper normalization
-            #loss = loss / args.iter_size
             scaler.scale(loss).backward()
 
             # Add segmentation loss
             loss_seg_value1 += loss1.data.cpu().numpy() + loss2.data.cpu().numpy() + loss3.data.cpu().numpy()
 
-            # train with target
-            
-            # try:
-            #     _, batch = next(targetloader_iter)
-            # except :
-            #     targetloader_iter = enumerate(dataloader_target)
-            #     _, batch = next(targetloader_iter)
-
-            _, batch = next(targetloader_iter)
-
-            images, _ = batch
-            images = images.cuda()
-            #print("+----------------------------------+")
-            #print("+--------- New Iteration ----------+")
-            #print("+----------------------------------+")
-            #print("images shape from target" + str(images.shape))
-
             with amp.autocast():
-                pred_target1, _, _ = model(images)
-                pred_target1 = interp_target(pred_target1)
+                # Feature extractor target
+                pred_target1, pred_target2, pred_target3 = model(images) # probability prediction of target
 
                 D_out1 = model_D1(F.softmax(pred_target1))
+                D_out2 = model_D2(F.softmax(pred_target2))
+                D_out3 = model_D3(F.softmax(pred_target3))
 
-                loss_adv_target1 = bce_loss(D_out1,
-                                       Variable(torch.FloatTensor(D_out1.data.size()).fill_(source_label)).cuda())
+                loss_adv_target1 = bce_loss(D_out1, Variable(torch.FloatTensor(D_out1.data.size()).fill_(source_label)).cuda())
+                loss_adv_target2 = bce_loss(D_out2, Variable(torch.FloatTensor(D_out2.data.size()).fill_(source_label)).cuda())
+                loss_adv_target3 = bce_loss(D_out3, Variable(torch.FloatTensor(D_out3.data.size()).fill_(source_label)).cuda())
             
-                loss = args.lambda_adv_target1 * loss_adv_target1
-                loss = loss / args.iter_size                #Should be noticed
+                loss = (args.lambda_adv_target1 * loss_adv_target1) + (args.lambda_adv_target2 * loss_adv_target2) + (args.lambda_adv_target3 * loss_adv_target3)
+                loss = loss / args.iter_size
             scaler.scale(loss).backward()
 
-            #print("+-------- Generator phase ---------+")
-            #print("Iteration : " + str(i))
-            #print("Images shape: " + str(images.shape) + " - Prediction shape :" + str(pred_target1.shape))
-            #print("+-------- Discriminator prediction ------------+")
-            #print("D_out1 shape : " + str(D_out1.shape) + " - D_out1 : " + str(D_out1))
-            #print("+-------- Adversarial loss ---------+")
-            #print("args.lambda_adv_target1 : " + str(args.lambda_adv_target1) + " - loss_adv_target1 : " + str(loss_adv_target1))
-            #print("+-------- Predictions target ------------+")
-            #print("pred_target1  " + str(pred_target1) + " - " + "pred_target1 shape" + str(pred_target1.shape))
-            #print("\n los adv target=",loss_adv_target1.data.cpu().numpy())
-            loss_adv_target_value1 += loss_adv_target1.data.cpu().numpy() / args.iter_size #Should be noticed 
+            loss_adv_target_value1 += loss_adv_target1.data.cpu().numpy() / args.iter_size
+            loss_adv_target_value2 += loss_adv_target2.data.cpu().numpy() / args.iter_size
+            loss_adv_target_value3 += loss_adv_target2.data.cpu().numpy() / args.iter_size
 
-            # train D
 
+
+            # train D (Discriminator)
             # bring back requires_grad
             for param in model_D1.parameters():
+                param.requires_grad = True
+            for param in model_D2.parameters():
+                param.requires_grad = True
+            for param in model_D3.parameters():
                 param.requires_grad = True
             
             # train with source
             pred1 = output.detach()
-
             with amp.autocast():
                 D_out1 = model_D1(F.softmax(pred1))
-            
-                loss_D1 = bce_loss(D_out1,
-                              Variable(torch.FloatTensor(D_out1.data.size()).fill_(source_label)).cuda())
-
+                loss_D1 = bce_loss(D_out1, Variable(torch.FloatTensor(D_out1.data.size()).fill_(source_label)).cuda())
                 loss_D1 = loss_D1 / args.iter_size / 2
             scaler.scale(loss_D1).backward()
             loss_D_value1 += loss_D1.data.cpu().numpy()
+
+            # train with source
+            pred2 = output_sup1.detach()
+            with amp.autocast():
+                D_out2 = model_D2(F.softmax(pred2))
+                loss_D2 = bce_loss(D_out2, Variable(torch.FloatTensor(D_out2.data.size()).fill_(source_label)).cuda())
+                loss_D2 = loss_D2 / args.iter_size / 2
+            scaler.scale(loss_D2).backward()
+            loss_D_value2 += loss_D2.data.cpu().numpy()
+
+            # train with source
+            pred3 = output_sup2.detach()
+            with amp.autocast():
+                D_out3 = model_D3(F.softmax(pred3))
+                loss_D3 = bce_loss(D_out3, Variable(torch.FloatTensor(D_out3.data.size()).fill_(source_label)).cuda())
+                loss_D3 = loss_D3 / args.iter_size / 2
+            scaler.scale(loss_D3).backward()
+            loss_D_value3 += loss_D3.data.cpu().numpy()
             
             # train with target
             pred_target1 = pred_target1.detach()
             with amp.autocast():
                 D_out1 = model_D1(F.softmax(pred_target1))
-                loss_D1 = bce_loss(D_out1,
-                              Variable(torch.FloatTensor(D_out1.data.size()).fill_(target_label)).cuda())
+                loss_D1 = bce_loss(D_out1,Variable(torch.FloatTensor(D_out1.data.size()).fill_(target_label)).cuda())
                 loss_D1 = loss_D1 / args.iter_size / 2
             scaler.scale(loss_D1).backward()
             loss_D_value1 += loss_D1.data.cpu().numpy()
 
-            #print("")
-            #print("+-------- Discriminator phase ---------+")
-            #print("+-------- Predictions source------------+")
-            #print("pred1 source   " + str(pred1) + " - " + "pred1 source shape" + str(pred1.shape))
-            #print("+-------- Predictions target ------------+")
-            #print("pred1 target   " + str(pred_target1) + " - " + "pred1 target shape" + str(pred_target1.shape))
-            #print("+-------- Discriminator loss ------------+")
-            #print("loss_D_value1 shape : " + str(loss_D_value1.shape) + " - loss_D_value1 : " + str(loss_D_value1))
+            # train with target
+            pred_target2 = pred_target2.detach()
+            with amp.autocast():
+                D_out2 = model_D2(F.softmax(pred_target2))
+                loss_D2 = bce_loss(D_out2,Variable(torch.FloatTensor(D_out2.data.size()).fill_(target_label)).cuda())
+                loss_D2 = loss_D2 / args.iter_size / 2
+            scaler.scale(loss_D2).backward()
+            loss_D_value2 += loss_D2.data.cpu().numpy()
 
-            print('iter = {0:8d}/{1:8d}, loss_seg1 = {2:.3f} loss_adv1 = {3:.3f}, loss_D1 = {4:.3f}'.format(
-                i, iterations, loss_seg_value1, loss_adv_target_value1, loss_D_value1))
+            # train with target
+            pred_target3 = pred_target3.detach()
+            with amp.autocast():
+                D_out3 = model_D3(F.softmax(pred_target3))
+                loss_D3 = bce_loss(D_out3,Variable(torch.FloatTensor(D_out3.data.size()).fill_(target_label)).cuda())
+                loss_D3 = loss_D3 / args.iter_size / 2
+            scaler.scale(loss_D3).backward()
+            loss_D_value3 += loss_D3.data.cpu().numpy()
+
+            print('iter = {0:8d}/{1:8d}, loss_seg1 = {2:.3f}, loss_adv1 = {3:.3f}, loss_adv2 = {3:.3f}, loss_adv2 = {3:.3f}, loss_D1 = {4:.3f}, loss_D2 = {4:.3f}, loss_D3 = {4:.3f}'.format(
+                i, iterations, loss_seg_value1, loss_adv_target_value1, loss_adv_target_value2, loss_adv_target_value3, loss_D_value1, loss_D_value2, loss_D_value3))
 
             scaler.step(optimizer)
             scaler.step(optimizer_D1)
+            scaler.step(optimizer_D2)
+            scaler.step(optimizer_D3)
             scaler.update()
 
         loss_total = loss_seg_value1
@@ -270,7 +292,7 @@ def train(args, model, optimizer, dataloader_source, dataloader_target, dataload
             if not os.path.isdir(args.save_model_path):
                 print("making directory " + args.save_model_path)
                 os.mkdir(args.save_model_path)
-            # Saving in the checkpoint also the epoch number and the optimizer to resume them --> FE
+            # Saving in the checkpoint also the epoch number and the optimizer to resume them
             checkpoint = {
                 'epoch': epoch + 1,
                 'state_dict': model.module.state_dict(),
@@ -278,7 +300,6 @@ def train(args, model, optimizer, dataloader_source, dataloader_target, dataload
                 'optimizer_D1': optimizer_D1.state_dict()
             }
 
-            #torch.save(model.module.state_dict(),os.path.join(args.save_model_path, 'latest_dice_loss.pth'))
             torch.save(checkpoint, os.path.join(args.save_model_path, 'latest_dice_loss.pth'))
             print("saving the model " + args.save_model_path)
 
@@ -332,33 +353,20 @@ def main(params):
     parser.add_argument("--lambda-seg", type=float, default = 0.1, help="lambda_seg")
     parser.add_argument("--lambda-adv-target1", type=float, default = 0.0002, help = "lambda adv for adversarial training ")
     parser.add_argument("--lambda-adv-target2", type=float, default = 0.001, help = "lambda adv for adversarial training ")
+    parser.add_argument("--lambda-adv-target3", type=float, default = 0.001, help = "lambda adv for adversarial training ")
     parser.add_argument("--momentum", type=float, default = 0.9, help="Momentum component of the optimiser")
     parser.add_argument("--learning-rate-D", type=float, default=1e-4, help="Base learning rate for discriminator")
     parser.add_argument("--gan", type=str, default='Vanilla', help="choose the GAN objective.") #I dont understand this shit
     parser.add_argument("--iter-size", type=int, default=1, help="iteration size")
 
     args = parser.parse_args(params)
-    # print(os.path.isdir(args.save_model_path)) # --> False
 
     # create dataset and dataloader
-    # Train and label path
+
     target_path = [os.path.join(args.data, 'train'), os.path.join(args.data, 'val'), os.path.join(args.data, 'test')]
     target_label_path = [os.path.join(args.data, 'train_labels'), os.path.join(args.data, 'val_labels'), os.path.join(args.data, 'test_labels')]
-    # Test and label path
 
-
-
-
-    
     csv_path = os.path.join(args.data, 'class_dict.csv')
-
-
-
-    # Defining dataset training, I crop with the height and width of images passed as parameters
-    # and I pass the defined loss
-    # dataset_train = CamVid(train_path, test_label_path, csv_path, scale=(args.crop_height, args.crop_width),
-    #                        loss=args.loss, mode='train')
-    # # Dataloader for Training set
 
 
     dataset_target = CamVid(target_path, target_label_path, csv_path, scale=(args.crop_height, args.crop_width),
@@ -412,6 +420,18 @@ def main(params):
     #model_D1.cuda(args.cuda)
     if torch.cuda.is_available() and args.use_gpu:
         model_D1 = torch.nn.DataParallel(model_D1).cuda()
+
+    model_D2 = FCDiscriminator(num_classes=args.num_classes)
+    model_D2.train() #initialize
+    #model_D1.cuda(args.cuda)
+    if torch.cuda.is_available() and args.use_gpu:
+        model_D2 = torch.nn.DataParallel(model_D2).cuda()
+
+    model_D3 = FCDiscriminator(num_classes=args.num_classes)
+    model_D3.train() #initialize
+    #model_D1.cuda(args.cuda)
+    if torch.cuda.is_available() and args.use_gpu:
+        model_D3 = torch.nn.DataParallel(model_D3).cuda()
     
 
 
@@ -430,7 +450,8 @@ def main(params):
 
     #build optimizer for discriminator
     optimizer_D1 = torch.optim.Adam(model_D1.parameters(), lr=args.learning_rate_D, betas=(0.9, 0.99))
-
+    optimizer_D2 = torch.optim.Adam(model_D2.parameters(), lr=args.learning_rate_D, betas=(0.9, 0.99))
+    optimizer_D3 = torch.optim.Adam(model_D3.parameters(), lr=args.learning_rate_D, betas=(0.9, 0.99))
     
     if args.gan == 'Vanilla':
         bce_loss = torch.nn.BCEWithLogitsLoss()
@@ -455,7 +476,7 @@ def main(params):
       
       
     # train (comment validation)
-    train(args, model, optimizer, dataloader_source, dataloader_target, dataloader_val, curr_epoch, model_D1, optimizer_D1, interp, interp_target, bce_loss)
+    train(args, model, optimizer, dataloader_source, dataloader_target, dataloader_val, curr_epoch, model_D1, optimizer_D1, model_D2, optimizer_D2, model_D3, optimizer_D3, interp, interp_target, bce_loss)
 
     # validation (comment training)
     # val(args, model, dataloader_val, csv_path)
@@ -464,8 +485,8 @@ def main(params):
 if __name__ == '__main__':
     params = [
         '--num_epochs', '101',
-        '--checkpoint_step', '2',
-        '--validation_step', '2',
+        '--checkpoint_step', '1',
+        '--validation_step', '1',
         '--learning_rate', '2.5e-2',
         '--data', '/content/drive/MyDrive/Politecnico/Machine Learning/BiseNetv1/dataset/CamVid',
         '--num_workers', '8',
@@ -474,8 +495,8 @@ if __name__ == '__main__':
         '--batch_size', '4',
         '--save_model_path', './checkpoints_101_sgd',
         '--context_path', 'resnet101',  # set resnet18 or resnet101, only support resnet18 and resnet101
-        '--optimizer', 'sgd', # we can try adam
-        '--pretrained_model_path', './checkpoints_101_sgd/latest_dice_loss.pth'
+        '--optimizer', 'sgd', 
+        '--pretrained_model_path', './checkpoints_101_sgd/best_dice_loss.pth'
     ]
     main(params)
 
